@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import { useLocation, useParams } from "wouter"
 import { toast } from "sonner"
+import { FileQuestion, Loader2 } from "lucide-react"
 
 import { TestHeader } from "@/components/test/TestHeader"
 import { QuestionCard } from "@/components/test/QuestionCard"
@@ -9,36 +10,49 @@ import { QuestionMapSheet } from "@/components/test/QuestionMapSheet"
 import { SubmitDialog } from "@/components/test/SubmitDialog"
 import { EmptyState } from "@/components/common/EmptyState"
 import { useApp } from "@/context/AppContext"
+import { useApiKey } from "@/context/ApiKeyContext"
+import { useTestHistory } from "@/hooks/useTestHistory"
 import { useTimer } from "@/hooks/useTimer"
-import { gradeTest } from "@/lib/gemini"
+import { gradeSemantic, gradeTest } from "@/lib/gemini"
+import { dataUrlToInlinePart } from "@/lib/imageUtils"
+import { getAllQuestions } from "@/lib/utils"
 import { PageTransition } from "@/components/layout/PageTransition"
-import { FileQuestion } from "lucide-react"
-import type {
-  GeneratedTest,
-  TestResult,
-} from "@/types/test"
+import type { GeneratedTest, TestResult } from "@/types/test"
+
+const SEMANTIC_TYPES = new Set(["short_answer", "long_answer", "fill_blank"])
 
 export function TestPage() {
   const params = useParams<{ id: string }>()
   const { getTest, saveResult } = useApp()
+  const { apiKey } = useApiKey()
+  const { addEntry } = useTestHistory()
   const [, navigate] = useLocation()
 
   const test = params.id ? getTest(params.id) : undefined
 
-  // Local answer state: questionId -> { text: string, images: string[] }
   const [answers, setAnswers] = useState<Record<number, { text: string; images: string[] }>>({})
   const [currentIndex, setCurrentIndex] = useState(0)
   const [mapOpen, setMapOpen] = useState(false)
   const [submitOpen, setSubmitOpen] = useState(false)
+  const [isGrading, setIsGrading] = useState(false)
   const startTimeRef = useRef<number>(Date.now())
 
-  // Flatten all questions for navigation, keeping track of section
   const allQuestions = useMemo(() => {
     if (!test) return []
-    const qs: Array<{ question: import("@/types/test").Question; sectionId: string; sectionName: string; sectionRequiredCount: number }> = []
+    const qs: Array<{
+      question: import("@/types/test").Question
+      sectionId: string
+      sectionName: string
+      sectionRequiredCount: number
+    }> = []
     test.sections.forEach(section => {
       section.questions.forEach(q => {
-        qs.push({ question: q, sectionId: section.id, sectionName: section.name, sectionRequiredCount: section.requiredCount })
+        qs.push({
+          question: q,
+          sectionId: section.id,
+          sectionName: section.name,
+          sectionRequiredCount: section.requiredCount,
+        })
       })
     })
     return qs
@@ -46,22 +60,17 @@ export function TestPage() {
 
   const totalSeconds = useMemo(
     () =>
-      test && test.config.timerEnabled
-        ? test.config.timerMinutes * 60
-        : 0,
+      test && test.config.timerEnabled ? test.config.timerMinutes * 60 : 0,
     [test],
   )
 
   const handleExpire = () => {
-    toast.warning("Time's up!", {
-      description: "Your test has been auto-submitted.",
-    })
+    toast.warning("Time's up!", { description: "Your test has been auto-submitted." })
     if (test) void doSubmit(test)
   }
 
   const timer = useTimer(totalSeconds, handleExpire)
 
-  // Start the timer once when the page mounts (if enabled).
   useEffect(() => {
     if (totalSeconds > 0) timer.start()
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -95,36 +104,39 @@ export function TestPage() {
     .map(({ i }) => i + 1)
 
   function setAnswer(questionId: number, value: string) {
-    setAnswers((prev) => ({ ...prev, [questionId]: { ...prev[questionId], text: value } }))
+    setAnswers(prev => ({ ...prev, [questionId]: { ...prev[questionId], text: value } }))
   }
 
   function addImageToAnswer(questionId: number, imageDataUrl: string) {
-    setAnswers((prev) => ({
+    setAnswers(prev => ({
       ...prev,
-      [questionId]: { ...prev[questionId], images: [...(prev[questionId]?.images || []), imageDataUrl] }
+      [questionId]: {
+        ...prev[questionId],
+        images: [...(prev[questionId]?.images || []), imageDataUrl],
+      },
     }))
   }
 
   function removeImageFromAnswer(questionId: number, imageIndex: number) {
-    setAnswers((prev) => ({
+    setAnswers(prev => ({
       ...prev,
       [questionId]: {
         ...prev[questionId],
-        images: prev[questionId]?.images.filter((_, i) => i !== imageIndex) || []
-      }
+        images: prev[questionId]?.images.filter((_, i) => i !== imageIndex) || [],
+      },
     }))
   }
 
   function goPrev() {
     if (currentIndex > 0) {
-      setCurrentIndex((i) => i - 1)
+      setCurrentIndex(i => i - 1)
       window.scrollTo({ top: 0, behavior: "smooth" })
     }
   }
 
   function goNext() {
     if (currentIndex < total - 1) {
-      setCurrentIndex((i) => i + 1)
+      setCurrentIndex(i => i + 1)
       window.scrollTo({ top: 0, behavior: "smooth" })
     }
   }
@@ -135,13 +147,49 @@ export function TestPage() {
     window.scrollTo({ top: 0, behavior: "smooth" })
   }
 
-  function doSubmit(testToSubmit: GeneratedTest): TestResult {
+  async function doSubmit(testToSubmit: GeneratedTest): Promise<void> {
     timer.pause()
+    setIsGrading(true)
+
     const elapsed = Math.round((Date.now() - startTimeRef.current) / 1000)
-    const result = gradeTest(testToSubmit, answers, elapsed)
+
+    // Start with fast local grading for all questions.
+    const localResult = gradeTest(testToSubmit, answers, elapsed)
+    const updatedAnswers = [...localResult.answers]
+
+    // Upgrade open-ended answers with AI semantic grading.
+    for (const q of getAllQuestions(testToSubmit)) {
+      if (!SEMANTIC_TYPES.has(q.type)) continue
+      const userText = answers[q.id]?.text ?? ""
+      const userImages = answers[q.id]?.images ?? []
+      if (!userText.trim() && !userImages.length) continue
+
+      try {
+        const userInput = userImages.length
+          ? userImages.map(dataUrlToInlinePart)
+          : userText
+        const { score, feedback } = await gradeSemantic(
+          apiKey,
+          q,
+          userInput,
+          testToSubmit.config.language,
+        )
+        const idx = updatedAnswers.findIndex(a => a.questionId === q.id)
+        if (idx !== -1) {
+          updatedAnswers[idx] = { ...updatedAnswers[idx], score, feedback }
+        }
+      } catch {
+        // Semantic grading failed for this question; keep the local grade.
+      }
+    }
+
+    const finalScore = updatedAnswers.reduce((sum, a) => sum + a.score, 0)
+    const result: TestResult = { ...localResult, answers: updatedAnswers, score: finalScore }
+
     saveResult(result)
+    addEntry(testToSubmit, result)
+    setIsGrading(false)
     navigate(`/results/${testToSubmit.id}`)
-    return result
   }
 
   return (
@@ -169,13 +217,17 @@ export function TestPage() {
             index={currentIndex + 1}
             total={total}
             answer={answers[currentQuestion.id]?.text ?? ""}
-            onAnswer={(value) => setAnswer(currentQuestion.id, value)}
+            onAnswer={value => setAnswer(currentQuestion.id, value)}
             onPrev={currentIndex > 0 ? goPrev : undefined}
             onNext={currentIndex < total - 1 ? goNext : undefined}
             isLast={currentIndex === total - 1}
             onSubmit={() => setSubmitOpen(true)}
-            onAddImage={(imageDataUrl) => currentQuestion && addImageToAnswer(currentQuestion.id, imageDataUrl)}
-            onRemoveImage={(imageIndex) => currentQuestion && removeImageFromAnswer(currentQuestion.id, imageIndex)}
+            onAddImage={imageDataUrl =>
+              currentQuestion && addImageToAnswer(currentQuestion.id, imageDataUrl)
+            }
+            onRemoveImage={imageIndex =>
+              currentQuestion && removeImageFromAnswer(currentQuestion.id, imageIndex)
+            }
             images={answers[currentQuestion.id]?.images || []}
           />
         )}
@@ -211,9 +263,19 @@ export function TestPage() {
         unanswered={unansweredIndices}
         onConfirm={() => {
           setSubmitOpen(false)
-          if (test) doSubmit(test)
+          if (test) void doSubmit(test)
         }}
       />
+
+      {/* AI grading overlay — shown while semantic grading runs after submission */}
+      {isGrading && (
+        <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-background/80 backdrop-blur-sm">
+          <div className="flex flex-col items-center gap-4 text-center px-6">
+            <Loader2 className="h-10 w-10 animate-spin text-primary" />
+            <p className="text-sm text-muted-foreground">Grading your answers with AI…</p>
+          </div>
+        </div>
+      )}
     </PageTransition>
   )
 }
